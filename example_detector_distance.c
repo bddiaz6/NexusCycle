@@ -50,25 +50,29 @@
 
 extern UART_HandleTypeDef huart2;
 
-#define TRACK_THRESH (0.25f)
-#define ON_VEL_MPS (0.8f)
-#define OFF_VEL_MPS (0.3f)
-#define VALID_MIN_DIST (0.1f)
-#define VALID_MAX_DIST (1.0f)
+#define VALID_MIN_DIST (0.35f)
+#define VALID_MAX_DIST (1.2f)
 #define MAX_SCORE_VEL (3.0f)
 #define WEIGHT_CLOSENESS (0.45f)
 #define WEIGHT_APPROACH (0.45f)
 #define WEIGHT_CONTINUITY (0.1f)
+#define TRACK_THRESH (0.25f)
 #define DIST_ALPHA (0.25f)
 #define HIST_LEN (5)
-#define MIN_WINDOW_DT (0.1f)
+#define MIN_WINDOW_DT (0.05f)
 #define APPROACH_ON_VEL (0.3f)
+#define APPROACH_OFF_VEL (0.0f)
+#define MAX_MISSES_BEFORE_DROP (5)
 
 typedef struct
 {
 	bool has_selection;
 	float selected_raw_dist;
 	float selected_filt_dist;
+
+	uint8_t miss_count;
+	uint8_t detection_latched;
+	uint8_t alert_latched;
 
 	float dist_hist[HIST_LEN];
 	uint32_t time_hist[HIST_LEN];
@@ -280,13 +284,13 @@ static void set_config(acc_detector_distance_config_t *detector_config, distance
 		case DISTANCE_PRESET_CONFIG_NEXUSCYCLE:
 			acc_detector_distance_config_start_set(detector_config, VALID_MIN_DIST);
 			acc_detector_distance_config_end_set(detector_config, VALID_MAX_DIST);
-			acc_detector_distance_config_max_step_length_set(detector_config, 0U);
+			acc_detector_distance_config_max_step_length_set(detector_config, 2U);
 			acc_detector_distance_config_max_profile_set(detector_config, ACC_CONFIG_PROFILE_5);
 			acc_detector_distance_config_reflector_shape_set(detector_config, ACC_DETECTOR_DISTANCE_REFLECTOR_SHAPE_GENERIC);
 			acc_detector_distance_config_peak_sorting_set(detector_config, ACC_DETECTOR_DISTANCE_PEAK_SORTING_STRONGEST);
 			acc_detector_distance_config_threshold_method_set(detector_config, ACC_DETECTOR_DISTANCE_THRESHOLD_METHOD_CFAR);
-			acc_detector_distance_config_threshold_sensitivity_set(detector_config, 0.5f);
-			acc_detector_distance_config_signal_quality_set(detector_config, 15.0f);
+			acc_detector_distance_config_threshold_sensitivity_set(detector_config, 0.65f);
+			acc_detector_distance_config_signal_quality_set(detector_config, 25.0f);
 			acc_detector_distance_config_close_range_leakage_cancellation_set(detector_config, false);
 			break;
 
@@ -486,6 +490,29 @@ static bool do_detector_get_next(distance_detector_resources_t  *resources,
 	return true;
 }
 
+//static void print_distance_result(const acc_detector_distance_result_t *result)
+//{
+//    if (result == NULL)
+//    {
+//        return;
+//    }
+//
+//    printf("num_distances=%u near_edge=%u temp=%d\n",
+//           result->num_distances,
+//           result->near_start_edge_status,
+//           result->temperature);
+//
+//    for (uint8_t i = 0; i < result->num_distances; i++)
+//    {
+//        printf("peak[%u]: dist=%.3f m strength=%.2f dB\n",
+//               i,
+//               result->distances[i],
+//               result->strengths[i]);
+//    }
+//}
+
+// *FILTERING ALGORITHM FUNCTIONS BELOW *
+
 static float clamp(float score)
 {
 	if (score < 0.0f)
@@ -499,6 +526,24 @@ static float clamp(float score)
 	}
 
 	return score;
+}
+
+static void tracker_reset(blindspot_tracker_t *t)
+{
+	t->has_selection = false;
+	t->selected_raw_dist_m = 0.0f;
+	t->filtered_dist_m = 0.0f;
+
+	memset(t->dist_hist, 0, sizeof(t->dist_hist));
+	memset(t->time_hist_ms, 0, sizeof(t->time_hist_ms));
+	t->hist_count = 0U;
+	t->hist_head = 0U;
+
+	t->on_count = 0U;
+	t->off_count = 0U;
+	t->lost_count = 0U;
+	t->output_state = 0U;
+	t->prev_update_ms = 0U;
 }
 
 static bool score_target(float candidate_dist, const blindspot_tracker_t *tracker, uint32_t now, target_candidate_t *out)
@@ -645,23 +690,50 @@ static void print_distance_result(const acc_detector_distance_result_t *result)
 	bool have_target = false;
 	bool have_vel = false;
 	float window_vel = 0.0f;
-	uint8_t byte;
+	uint8_t byte = t->output_state;
 
 	if (result == NULL)
 	{
 		return;
 	}
 
+//	printf("num_distances=%d\n", result->num_distances);
+//	for (uint8_t i = 0; i < result->num_distances; i++)
+//	{
+//	    printf("dist[%d]=%.3f\n", i, result->distances[i]);
+//	}
+
 	have_target = select_most_dangerous_target(result, t, curr_time, &best);
 
 	if (!have_target)
 	{
-		t->output_state = 0;
-		byte = 0;
-		HAL_UART_Transmit(&huart2, &byte, 1, HAL_MAX_DELAY);
+		if (t->has_selection)
+		{
+			t->miss_count++;
+
+			if (t->miss_count < MAX_MISSES_BEFORE_DROP)
+			{
+//				printf("TRACK LOST TEMP: miss=%u state=%u\n", t->miss_count, t->output_state);
+				return;
+			}
+		}
+
+		t->has_selection = false;
+		t->hist_count = 0;
+		t->hist_head = 0;
+		t->miss_count = 0;
+		if (t->output_state != 0)
+		{
+			t->output_state = 0;
+			byte = 0;
+			HAL_UART_Transmit(&huart2, &byte, 1, HAL_MAX_DELAY);
+		}
+
 		printf("OFF: no valid target\n");
 		return;
 	}
+
+	t->miss_count = 0;
 
 	if (!t->has_selection)
 	{
@@ -672,6 +744,15 @@ static void print_distance_result(const acc_detector_distance_result_t *result)
 		update_windows(t, t->selected_filt_dist, curr_time);
 
 		return;
+	}
+
+	if (t->has_selection)
+	{
+	    if (fabsf(best.dist - t->selected_filt_dist) > TRACK_THRESH)
+	    {
+	        printf("REJECT: jump too large old=%.3f new=%.3f\n", t->selected_filt_dist, best.dist);
+	        return;
+	    }
 	}
 
 	t->selected_raw_dist = best.dist;
@@ -686,76 +767,21 @@ static void print_distance_result(const acc_detector_distance_result_t *result)
 		return;
 	}
 
-	if ((window_vel >= APPROACH_ON_VEL) && (t->output_state == 0))
+	if ((window_vel >= APPROACH_ON_VEL) && !t->alert_latched)
 	{
-		t->output_state = 1;
-		byte = 1;
-		printf("ON: d=%.3f filt=%.3f vel=%.3f score=%.3f\r\n", best.dist, t->selected_filt_dist, window_vel, best.score);
-
+	    byte = 1;
+	    HAL_UART_Transmit(&huart2, &byte, 1, HAL_MAX_DELAY);
+	    t->alert_latched = 1;
+	    t->output_state = 1;
+	    printf("ALERT ON: d=%.3f vel=%.3f\n", best.dist, window_vel);
 	}
-	else if ((window_vel < APPROACH_ON_VEL) && (t->output_state == 1))
+	else if ((window_vel <= APPROACH_OFF_VEL) && t->alert_latched)
 	{
-		t->output_state = 0;
-		byte = 0;
-		printf("OFF: d=%.3f filt=%.3f vel=%.3f score=%.3f\r\n", best.dist, t->selected_filt_dist, window_vel, best.score);
+	    byte = 0;
+	    HAL_UART_Transmit(&huart2, &byte, 1, HAL_MAX_DELAY);
+	    t->alert_latched = 0;
+	    t->output_state = 0;
+	    printf("ALERT OFF: d=%.3f vel=%.3f\n", best.dist, window_vel);
 	}
-	else
-		{
-			printf("TRACK: d=%.3f filt=%.3f vel=%.3f score=%.3f close=%.3f app=%.3f cont=%.3f state=%u\r\n",
-			       best.dist_m,
-			       t->filtered_dist_m,
-			       window_vel_mps,
-			       best.score,
-			       best.closeness_score,
-			       best.approach_score,
-			       best.continuity_score,
-			       t->output_state);
-		}
 
-	HAL_UART_Transmit(&huart2, &byte, 1, HAL_MAX_DELAY);
-
-//	uint8_t byte = 0;
-//	static bool has_prev = false;
-//	static float prev_dist = 0.0f;
-//	static float prev_time = 0.0f;
-//	static uint8_t prev_byte;
-//	float curr_dist = result->distances[0];
-//	float curr_time = HAL_GetTick();
-//	float raw_vel = 0;
-//
-//	if (result->num_distances > 0)
-//	{
-//
-//		if (has_prev)
-//		{
-//			float dt_sec = (curr_time - prev_time) / 1000.0f;
-//			if (dt_sec > 0.0f)
-//			{
-//				raw_vel = -(curr_dist - prev_dist) / dt_sec;
-//				byte = (raw_vel > 0.2f) ? 1 : 0;
-//			}
-//		}
-//
-//		has_prev = true;
-//		prev_dist = curr_dist;
-//		prev_time = curr_time;
-//	}
-//	else
-//	{
-//		has_prev = false;
-//		byte = 0;
-//	}
-//	if (prev_byte != byte)
-//	{
-//		printf("dist=%.3f m, vel=%.3f m/s\n", curr_dist, raw_vel);
-//		if (byte) {
-//			printf("ON");
-//		}
-//		else
-//		{
-//			printf("OFF");
-//		}
-//		HAL_UART_Transmit(&huart2, &byte, 1, HAL_MAX_DELAY);
-//		prev_byte = byte;
-//	}
 }
